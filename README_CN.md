@@ -52,7 +52,7 @@ Plugin 在后台线程里启动自己的 `ThreadingHTTPServer`。消息到达时
 
 ### v1：Gateway patch（旧方案）
 
-原来的方案需要 patch Hermes gateway 源码，把 A2A 注册为一个平台适配器（和 Telegram、Discord 同级）。这个方案仍然可用，但不再推荐。详见下方 [Legacy gateway patch](#legacy-gateway-patch)。
+原来的方案需要 patch Hermes gateway 源码，把 A2A 注册为一个平台适配器（和 Telegram、Discord 同级）。这个方案仍然可用，但不再推荐。旧版源文件在 `legacy/` 目录。详见下方 [Legacy gateway patch](#legacy-gateway-patch)。
 
 ## 架构（v2 — plugin）
 
