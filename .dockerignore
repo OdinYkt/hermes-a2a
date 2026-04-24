@@ -1,0 +1,11 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.env
+build/
+dist/
+docs/
+scripts/
+README_CN.md

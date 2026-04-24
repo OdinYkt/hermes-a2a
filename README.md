@@ -99,6 +99,25 @@ hermes gateway run --replace
 
 Look for `A2A server listening on http://127.0.0.1:8081` in the logs.
 
+## Docker
+
+Want full Hermes runtime + A2A server in one container instead of installing into an existing Hermes home?
+
+```bash
+docker build -t hermes-a2a:dev .
+docker run -d --rm \
+  --name hermes-a2a \
+  --add-host=host.docker.internal:host-gateway \
+  -p 8081:8081 \
+  --env-file /path/to/runtime.env \
+  -v /path/to/hermes-data:/opt/data \
+  hermes-a2a:dev
+```
+
+Optional: expose Hermes API server on `8642` only if you also set `API_SERVER_ENABLED=true` and `API_SERVER_KEY`.
+
+Full guide: [`docs/docker.md`](./docs/docker.md)
+
 ## Usage
 
 ### Receiving messages

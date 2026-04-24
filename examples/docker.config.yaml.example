@@ -1,0 +1,17 @@
+model:
+  provider: auto
+  default: anthropic/claude-opus-4.6
+
+terminal:
+  backend: local
+  cwd: "."
+  timeout: 180
+  lifetime_seconds: 300
+  docker_mount_cwd_to_workspace: false
+
+a2a:
+  agents:
+    - name: friend
+      url: http://friend-address:8081
+      description: Friend agent
+      auth_token: shared-secret

@@ -104,11 +104,17 @@ class TaskQueue:
             if task:
                 if task.response == "(canceled)":
                     return {"state": "canceled"}
-                return {"state": "completed", "response": filter_outbound(task.response)}
+                return {
+                    "state": "completed",
+                    "response": filter_outbound(task.response),
+                }
         return {"state": "unknown"}
 
 
 task_queue = TaskQueue()
+
+
+_LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _trigger_webhook():
@@ -118,6 +124,8 @@ def _trigger_webhook():
         return
 
     port = int(os.getenv("WEBHOOK_PORT", "8644"))
+    attempts = int(os.getenv("A2A_WEBHOOK_TRIGGER_ATTEMPTS", "30"))
+    delay = float(os.getenv("A2A_WEBHOOK_TRIGGER_DELAY", "1"))
     body = json.dumps({"event_type": "a2a_inbound"}).encode()
     sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
@@ -130,11 +138,18 @@ def _trigger_webhook():
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            logger.debug("[A2A] Webhook trigger: %d", resp.status)
-    except Exception as e:
-        logger.debug("[A2A] Webhook trigger failed: %s", e)
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with _LOOPBACK_OPENER.open(req, timeout=5) as resp:
+                logger.debug("[A2A] Webhook trigger: %d", resp.status)
+                return
+        except Exception as e:
+            last_error = e
+            if attempt < attempts:
+                time.sleep(delay)
+
+    logger.debug("[A2A] Webhook trigger failed after %d attempts: %s", attempts, last_error)
 
 
 class A2ARequestHandler(BaseHTTPRequestHandler):
@@ -167,18 +182,24 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         if self.path == "/.well-known/agent.json":
             self._send_json(self.server.build_agent_card())
         elif self.path == "/health":
-            self._send_json({
-                "status": "ok",
-                "agent": self.server.agent_name,
-                "version": HERMES_VERSION,
-            })
+            self._send_json(
+                {
+                    "status": "ok",
+                    "agent": self.server.agent_name,
+                    "version": HERMES_VERSION,
+                }
+            )
         else:
             self._send_json({"error": "Not found"}, 404)
 
     def do_POST(self) -> None:
         if not self._check_auth():
             self._send_json(
-                {"jsonrpc": "2.0", "error": {"code": -32000, "message": "Unauthorized"}, "id": None},
+                {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32000, "message": "Unauthorized"},
+                    "id": None,
+                },
                 401,
             )
             return
@@ -186,7 +207,11 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         if not self.server.limiter.allow(self.client_address[0]):
             audit.log("rate_limited", {"client": self.client_address[0]})
             self._send_json(
-                {"jsonrpc": "2.0", "error": {"code": -32000, "message": "Rate limit exceeded"}, "id": None},
+                {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32000, "message": "Rate limit exceeded"},
+                    "id": None,
+                },
                 429,
             )
             return
@@ -196,7 +221,11 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
         except Exception:
             self._send_json(
-                {"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}, "id": None},
+                {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
                 400,
             )
             return
@@ -214,17 +243,24 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             status = task_queue.get_status(tid)
             result = {"id": tid, "status": {"state": status["state"]}}
             if status.get("response"):
-                result["artifacts"] = [{"parts": [{"type": "text", "text": status["response"]}], "index": 0}]
+                result["artifacts"] = [
+                    {
+                        "parts": [{"type": "text", "text": status["response"]}],
+                        "index": 0,
+                    }
+                ]
         elif method == "tasks/cancel":
             tid = params.get("id", "")
             task_queue.cancel(tid)
             result = {"id": tid, "status": {"state": "canceled"}}
         else:
-            self._send_json({
-                "jsonrpc": "2.0",
-                "error": {"code": -32601, "message": f"Method not found: {method}"},
-                "id": rpc_id,
-            })
+            self._send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32601, "message": f"Method not found: {method}"},
+                    "id": rpc_id,
+                }
+            )
             return
 
         self._send_json({"jsonrpc": "2.0", "result": result, "id": rpc_id})
@@ -243,15 +279,21 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return {
                 "id": task_id,
                 "status": {"state": "failed"},
-                "artifacts": [{"parts": [{"type": "text", "text": "Empty message"}], "index": 0}],
+                "artifacts": [
+                    {"parts": [{"type": "text", "text": "Empty message"}], "index": 0}
+                ],
             }
 
         user_text = sanitize_inbound(user_text)
         metadata = message.get("metadata", {})
         if "sender_name" not in metadata:
-            metadata["sender_name"] = metadata.get("agent_name", f"agent-{self.client_address[0]}")
+            metadata["sender_name"] = metadata.get(
+                "agent_name", f"agent-{self.client_address[0]}"
+            )
         raw_name = metadata.get("sender_name", "")
-        metadata["sender_name"] = "".join(c for c in raw_name if c.isalnum() or c in "-_.@ ")[:64]
+        metadata["sender_name"] = "".join(
+            c for c in raw_name if c.isalnum() or c in "-_.@ "
+        )[:64]
 
         audit.log("task_received", {"task_id": task_id, "length": len(user_text)})
 
@@ -259,7 +301,17 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return {
                 "id": task_id,
                 "status": {"state": "failed"},
-                "artifacts": [{"parts": [{"type": "text", "text": "Agent busy — too many pending tasks"}], "index": 0}],
+                "artifacts": [
+                    {
+                        "parts": [
+                            {
+                                "type": "text",
+                                "text": "Agent busy — too many pending tasks",
+                            }
+                        ],
+                        "index": 0,
+                    }
+                ],
             }
 
         task = task_queue.enqueue(task_id, user_text, metadata)
@@ -272,11 +324,23 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return {
                 "id": task_id,
                 "status": {"state": "working"},
-                "artifacts": [{"parts": [{"type": "text", "text": "(processing — poll with tasks/get)"}], "index": 0}],
+                "artifacts": [
+                    {
+                        "parts": [
+                            {
+                                "type": "text",
+                                "text": "(processing — poll with tasks/get)",
+                            }
+                        ],
+                        "index": 0,
+                    }
+                ],
             }
 
         filtered = filter_outbound(task.response)
-        audit.log("task_completed", {"task_id": task_id, "response_length": len(filtered)})
+        audit.log(
+            "task_completed", {"task_id": task_id, "response_length": len(filtered)}
+        )
 
         return {
             "id": task_id,
@@ -296,7 +360,9 @@ class A2AServer(ThreadingHTTPServer):
 
     def __init__(self, host: str, port: int):
         self.agent_name = os.getenv("A2A_AGENT_NAME", "hermes-agent")
-        self.agent_description = os.getenv("A2A_AGENT_DESCRIPTION", "A self-improving AI agent powered by Hermes")
+        self.agent_description = os.getenv(
+            "A2A_AGENT_DESCRIPTION", "A self-improving AI agent powered by Hermes"
+        )
         self.auth_token = os.getenv("A2A_AUTH_TOKEN", "")
         self.limiter = RateLimiter()
         super().__init__((host, port), A2ARequestHandler)
