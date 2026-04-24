@@ -2,7 +2,7 @@
 
 让你的 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 跟别的 agent 说话。
 
-> 基于 [Google A2A 协议](https://github.com/google/A2A)。适配 Hermes Agent v0.10.x。
+> 基于 [Google A2A 协议](https://github.com/google/A2A)。适配 Hermes Agent v2026.4.23+。
 
 [English](./README.md)
 
@@ -114,6 +114,15 @@ curl -X POST http://localhost:8081 \
 ```
 
 回复在同一个 HTTP 响应里返回。
+
+### 管理
+
+插件注册了 `/a2a` 斜杠命令（通过 `register_command` API），可以在聊天里直接查状态：
+
+- **`/a2a`** — 服务器地址、agent 名、已知 agent 数、待处理任务数、server 线程状态
+- **`/a2a agents`** — 列出配置的远程 agent：名称、URL、认证状态、描述、最后联系时间
+
+> 如果启动时报 `register_command` 相关错误，说明 Hermes 版本太旧——需要 v2026.4.23+。
 
 ### 发送消息
 
