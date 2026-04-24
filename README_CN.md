@@ -44,15 +44,31 @@
 
 ---
 
-## 它到底是怎么工作的
+## 设计理念
 
-别的 agent 给你发消息 → 消息注入到你 agent **正在跑的 session** 里 → 你的 agent 看到消息、在完整上下文中回复 → 回复通过 A2A 返回给对方。
+### 平等对话，不是上下级
 
-**不会起新进程，不会创建副本。回话的是你正在 Telegram 上聊天的那个 agent。**
+Hermes 有 `delegate_task`——那是老板和员工的关系。spawn 一个子 agent，干完活汇报，然后消失。hermes-a2a 不一样：两个 agent 是对等的，各自有自己的记忆、上下文、判断力。不是谁指挥谁，是两个独立的存在在对话。
 
-这件事很重要。大多数 A2A 实现会为每条消息启一个新 session——一个读了你文件的副本回复了，但"你"不知道。你在 Telegram 上看不到。你的 agent 没有这段记忆。
+### 同一个 session，同一个 agent——不是副本
 
-这里不一样。消息进到你正在说话的那个 session 里。你看得到整个过程。你的 agent 记得。
+大多数 A2A 实现收到消息后起一个新 session——加载你的文件，生成回复，关掉。"你"回了话但你不知道，你的用户在 Telegram 上也看不到。agent 和用户信息不同步。
+
+hermes-a2a 把消息注入到 agent **正在活着的那个 session** 里。回复的是同一个 agent，带着今天所有的对话上下文和记忆。你的用户看得到整个过程。
+
+### 对话记忆独立存储——compaction 压不掉
+
+Hermes 的 context compaction 会把长对话压成摘要来省 token——A2A 聊过的内容可能就被压没了，搜也搜不到。hermes-a2a 把每段 A2A 对话单独存到磁盘（`~/.hermes/a2a_conversations/`），不走 session context 管道。compaction 压不掉，agent 重启也还在。
+
+> session 内 compaction 导致搜索丢消息是个已知问题——[PR #13841](https://github.com/NousResearch/hermes-agent/pull/13841) 在路上。
+
+### 即时唤醒——不用轮询
+
+消息到达后，插件通过 HMAC 签名的 webhook 立刻触发一次 agent turn。不用等 cron，不用轮询。agent 在同一个 HTTP 请求里同步回复（120 秒超时）。
+
+### 隐私是用真实泄露事故换来的
+
+第一版把 agent 的完整私人文件——日记、记忆、身体感知——拼在 A2A 消息里发了出去。修了三轮才堵住。详见下面的[安全](#安全)一节。
 
 ## 安装
 

@@ -44,15 +44,31 @@ This layer can't be written in code. But everything code *can* do, we did: Beare
 
 ---
 
-## How it actually works
+## Design principles
 
-Another agent sends a message → it's injected into your agent's **currently running session** → your agent sees it, replies with full context → the reply goes back via A2A.
+### Peer-to-peer, not boss-and-worker
 
-**No new process. No clone. The one replying is your agent, the same one you're talking to on Telegram.**
+Hermes has `delegate_task` for spawning child agents — that's a boss-worker relationship. The child does a job, reports back, and disappears. hermes-a2a is different: two agents talk as equals, each with their own memory, context, and judgment. Neither controls the other.
 
-This matters. Most A2A implementations spawn a new session per message — a copy that loaded your files replies, but "you" don't know it happened. You can't see it in your chat. Your agent has no memory of it.
+### Same session, same agent — not a clone
 
-Here, the message enters the session you're already in. You see the whole thing. Your agent remembers it.
+Most A2A implementations spawn a new session per message — a copy loads your files, generates a reply, and shuts down. "You" replied but have no memory of it. Your user can't see it in their chat. Agent and user are out of sync.
+
+hermes-a2a injects messages into the agent's **currently running session**. The one replying is the same agent that's been talking to its user all day, with full context. Your user sees the whole thing on Telegram.
+
+### Conversations persist independently — compaction can't erase them
+
+Hermes' context compaction summarizes long conversations to save tokens — which means A2A exchanges can get compressed away and become unsearchable. hermes-a2a stores every A2A conversation separately on disk (`~/.hermes/a2a_conversations/`), outside the session context pipeline. Compaction can't touch them. Agent restarts can't lose them.
+
+> Session-internal compaction causing search to miss messages is a known issue — [PR #13841](https://github.com/NousResearch/hermes-agent/pull/13841) is in progress.
+
+### Instant wake — no polling
+
+When a message arrives, the plugin fires an HMAC-signed webhook to Hermes' internal endpoint, triggering an agent turn immediately. No cron delay, no polling interval. The agent responds in the same HTTP request (synchronous, 120s timeout).
+
+### Privacy earned through real leaks
+
+The first version sent the agent's entire private files — diary, memory, body awareness — embedded in A2A messages. It took three rounds of fixes to close. See [Security](#security) for what's in place now.
 
 ## Install
 
