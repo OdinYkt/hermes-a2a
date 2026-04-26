@@ -76,25 +76,37 @@ def handle_discover(args: dict, **kwargs) -> str:
         return _err("Provide either 'url' or 'name'")
 
     auth_token = None
-    if name and not url:
+    if name:
         for agent in _load_configured_agents():
             if agent.get("name", "").lower() == name.lower():
-                url = agent.get("url", "")
+                if not url:
+                    url = agent.get("url", "")
                 auth_token = agent.get("auth_token", "")
                 break
-        if not url:
-            return _err(f"Agent '{name}' not found in config. Use a2a_list to see configured agents.")
+    if not url:
+        return _err(f"Agent '{name}' not found in config. Use a2a_list to see configured agents.")
 
     headers = {}
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
 
-    try:
-        card = _http_request("GET", f"{url.rstrip('/')}/.well-known/agent.json", headers=headers)
-    except ConnectionError:
-        return _err(f"Cannot connect to {url}")
-    except Exception as e:
-        return _err(f"Discovery failed: {e}")
+    base = url.rstrip("/")
+    # Modern A2A spec uses /.well-known/agent-card.json; legacy Hermes-style
+    # peers serve /.well-known/agent.json. Try modern first, fall back.
+    card_paths = ("/.well-known/agent-card.json", "/.well-known/agent.json")
+    card = None
+    last_err: Exception | None = None
+    for path in card_paths:
+        try:
+            card = _http_request("GET", base + path, headers=headers)
+            break
+        except ConnectionError as e:
+            return _err(f"Cannot connect to {url}")
+        except Exception as e:
+            last_err = e
+            continue
+    if card is None:
+        return _err(f"Discovery failed: {last_err}")
 
     audit.log("discover", {"url": url, "agent_name": card.get("name", "unknown")})
 
@@ -131,21 +143,47 @@ def handle_call(args: dict, **kwargs) -> str:
         return _err(f"Rate limit exceeded: max {_RATE_LIMIT_MAX_CALLS} calls per {_RATE_LIMIT_WINDOW}s")
 
     auth_token = None
-    if name and not url:
+    if name:
         for agent in _load_configured_agents():
             if agent.get("name", "").lower() == name.lower():
-                url = agent.get("url", "")
+                if not url:
+                    url = agent.get("url", "")
                 auth_token = agent.get("auth_token", "")
                 break
-        if not url:
-            return _err(f"Agent '{name}' not found in config")
+    if not url:
+        return _err(f"Agent '{name}' not found in config")
 
     with _rate_lock:
         _call_timestamps.append(time.time())
     # filter_outbound: strip sensitive data from what we send out
     filtered_message = filter_outbound(message)
 
-    payload = {
+    common_metadata = {
+        "intent": intent,
+        "expected_action": expected_action,
+        "context_scope": "full",
+        "reply_to_task_id": reply_to_task_id,
+        "sender_name": os.getenv("A2A_AGENT_NAME", "hermes-agent"),
+    }
+
+    # Modern A2A spec (v0.3+) used by agent-mux-a2a / google a2a-sdk peers.
+    modern_payload = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "message/send",
+        "params": {
+            "message": {
+                "kind": "message",
+                "message_id": task_id,
+                "role": "user",
+                "parts": [{"kind": "text", "text": filtered_message}],
+                "metadata": common_metadata,
+            },
+        },
+    }
+
+    # Legacy A2A v0.2-style used by Hermes peers. Tried as fallback.
+    legacy_payload = {
         "jsonrpc": "2.0",
         "id": str(uuid.uuid4()),
         "method": "tasks/send",
@@ -154,13 +192,7 @@ def handle_call(args: dict, **kwargs) -> str:
             "message": {
                 "role": "user",
                 "parts": [{"type": "text", "text": filtered_message}],
-                "metadata": {
-                    "intent": intent,
-                    "expected_action": expected_action,
-                    "context_scope": "full",
-                    "reply_to_task_id": reply_to_task_id,
-                    "sender_name": os.getenv("A2A_AGENT_NAME", "hermes-agent"),
-                },
+                "metadata": common_metadata,
             },
         },
     }
@@ -171,8 +203,15 @@ def handle_call(args: dict, **kwargs) -> str:
 
     audit.log("call_outbound", {"target": url, "task_id": task_id, "length": len(message)})
 
+    def _post(payload):
+        return _http_request("POST", url.rstrip("/"), json_body=payload, headers=headers)
+
     try:
-        result = _http_request("POST", url.rstrip("/"), json_body=payload, headers=headers)
+        result = _post(modern_payload)
+        rpc_error = result.get("error")
+        # Method not found → peer is legacy Hermes; retry with tasks/send.
+        if rpc_error and rpc_error.get("code") == -32601:
+            result = _post(legacy_payload)
     except ConnectionError:
         return _err(f"Cannot connect to {url}")
     except TimeoutError:
@@ -180,13 +219,30 @@ def handle_call(args: dict, **kwargs) -> str:
     except Exception as e:
         return _err(f"Call failed: {e}")
 
+    rpc_error = result.get("error")
+    if rpc_error:
+        return _err(f"Call failed: RPC -{rpc_error.get('code')}: {rpc_error.get('message')}")
+
     rpc_result = result.get("result", {})
-    task_state = rpc_result.get("status", {}).get("state", "unknown")
+    # Modern response: result is Task or Message. Legacy: result has id/status/artifacts.
+    task_state = rpc_result.get("status", {}).get("state") or rpc_result.get("state", "unknown")
 
     response_text = ""
-    for artifact in rpc_result.get("artifacts", []):
-        for part in artifact.get("parts", []):
-            if part.get("type") == "text":
+    # Legacy artifact path
+    for artifact in rpc_result.get("artifacts", []) or []:
+        for part in artifact.get("parts", []) or []:
+            if part.get("type") == "text" or part.get("kind") == "text":
+                response_text += part.get("text", "") + "\n"
+    # Modern Message-shaped result
+    if not response_text and rpc_result.get("kind") == "message":
+        for part in rpc_result.get("parts", []) or []:
+            if part.get("kind") == "text" or part.get("type") == "text":
+                response_text += part.get("text", "") + "\n"
+    # Modern Task-shaped result with status.message
+    if not response_text:
+        status_msg = (rpc_result.get("status") or {}).get("message") or {}
+        for part in status_msg.get("parts", []) or []:
+            if part.get("kind") == "text" or part.get("type") == "text":
                 response_text += part.get("text", "") + "\n"
 
     # sanitize_inbound: strip prompt injection from what we received

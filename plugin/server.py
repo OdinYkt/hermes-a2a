@@ -117,7 +117,17 @@ task_queue = TaskQueue()
 _LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def _trigger_webhook():
+def _derive_session_chat_id(metadata: dict | None) -> str:
+    """Stable chat_id so all messages from same TG user / peer reuse one session."""
+    md = metadata or {}
+    sender_id = md.get("sender_id")
+    if sender_id not in (None, "", 0):
+        return f"webhook:a2a_trigger:tg-{sender_id}"
+    sender_name = md.get("sender_name", "default")
+    return f"webhook:a2a_trigger:peer-{sender_name}"
+
+
+def _trigger_webhook(metadata: dict | None = None):
     """POST to the internal webhook to trigger an agent turn."""
     secret = os.getenv("A2A_WEBHOOK_SECRET", "")
     if not secret:
@@ -126,15 +136,22 @@ def _trigger_webhook():
     port = int(os.getenv("WEBHOOK_PORT", "8644"))
     attempts = int(os.getenv("A2A_WEBHOOK_TRIGGER_ATTEMPTS", "30"))
     delay = float(os.getenv("A2A_WEBHOOK_TRIGGER_DELAY", "1"))
-    body = json.dumps({"event_type": "a2a_inbound"}).encode()
+    session_chat_id = _derive_session_chat_id(metadata)
+    body = json.dumps({
+        "event_type": "a2a_inbound",
+        "session_chat_id": session_chat_id,
+    }).encode()
     sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
+    # X-Request-ID needs to be unique per call (idempotency dedup) but can
+    # carry the stable session_chat_id as a prefix for traceability.
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/webhooks/a2a_trigger",
         data=body,
         headers={
             "Content-Type": "application/json",
             "X-Hub-Signature-256": sig,
+            "X-Request-ID": f"{session_chat_id}-{int(time.time()*1000)}",
         },
         method="POST",
     )
@@ -316,7 +333,7 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
 
         task = task_queue.enqueue(task_id, user_text, metadata)
 
-        threading.Thread(target=_trigger_webhook, daemon=True).start()
+        threading.Thread(target=_trigger_webhook, args=(metadata,), daemon=True).start()
 
         task.ready.wait(timeout=_RESPONSE_TIMEOUT)
 

@@ -65,6 +65,24 @@ export no_proxy="$NO_PROXY"
 
 mkdir -p "$HERMES_HOME"
 
+# Patch upstream Hermes webhook.py so payload['session_chat_id'] becomes the
+# session key (instead of always per-delivery_id). Lets the a2a plugin pin all
+# messages from one TG sender / peer to the same Hermes session. Idempotent.
+/opt/hermes/.venv/bin/python - <<'PY'
+import pathlib
+p = pathlib.Path("/opt/hermes/gateway/platforms/webhook.py")
+src = p.read_text()
+old = 'session_chat_id = f"webhook:{route_name}:{delivery_id}"'
+new = 'session_chat_id = payload.get("session_chat_id") or f"webhook:{route_name}:{delivery_id}"'
+if new in src:
+    pass
+elif old in src:
+    p.write_text(src.replace(old, new, 1))
+    print("[entrypoint] patched webhook.py session_chat_id derivation")
+else:
+    print("[entrypoint] WARN: webhook.py session_chat_id line not found, leaving unpatched")
+PY
+
 /opt/hermes-a2a/docker/install-plugin.sh
 
 exec /opt/hermes/docker/entrypoint.sh "$@"
