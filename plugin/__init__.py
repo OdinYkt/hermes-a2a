@@ -37,10 +37,46 @@ _active_a2a_tasks: dict[str, dict] = {}  # task_id → {text, metadata}
 _active_tasks_lock = threading.Lock()
 
 
+def _validate_config():
+    """Warn on missing webhook config at startup. Does not modify config."""
+    if not os.getenv("A2A_WEBHOOK_SECRET", ""):
+        logger.warning("[A2A] A2A_WEBHOOK_SECRET not set — instant wake disabled, messages will queue until next user turn")
+
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception:
+        return
+
+    # Check webhook routes for a2a_trigger
+    route = None
+    for location in [
+        cfg.get("webhook", {}).get("extra", {}).get("routes", {}),
+        cfg.get("platforms", {}).get("webhook", {}).get("extra", {}).get("routes", {}),
+    ]:
+        if isinstance(location, dict) and "a2a_trigger" in location:
+            route = location["a2a_trigger"]
+            break
+
+    if not route:
+        logger.warning("[A2A] No a2a_trigger webhook route in config.yaml — re-run install.sh to configure")
+        return
+
+    source = route.get("source")
+    if not source or not source.get("chat_id"):
+        logger.warning(
+            "[A2A] a2a_trigger route has no source override — A2A messages will open "
+            "separate webhook sessions instead of joining your main chat. "
+            "Re-run install.sh to auto-configure."
+        )
+
+
 def register(ctx):
     if not os.getenv("A2A_ENABLED", "").lower() in ("1", "true", "yes"):
         logger.info("[A2A] Disabled (set A2A_ENABLED=true to enable)")
         return
+
+    _validate_config()
 
     ctx.register_tool("a2a_discover", "a2a", A2A_DISCOVER, handle_discover)
     ctx.register_tool("a2a_call", "a2a", A2A_CALL, handle_call)
