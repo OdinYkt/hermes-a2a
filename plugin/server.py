@@ -32,7 +32,9 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8081
 _TASK_CACHE_MAX = 1000
 _MAX_PENDING = 10
-_RESPONSE_TIMEOUT = 120  # seconds to wait for agent response
+_RESPONSE_TIMEOUT = float(os.getenv("A2A_RESPONSE_TIMEOUT", "120"))  # seconds to wait for agent response
+_RATE_LIMIT_MAX_REQUESTS = int(os.getenv("A2A_RATE_LIMIT_MAX_REQUESTS", "20"))
+_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("A2A_RATE_LIMIT_WINDOW_SECONDS", "60"))
 
 try:
     from hermes_cli import __version__ as HERMES_VERSION
@@ -240,8 +242,6 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _check_auth(self) -> bool:
-        if _harness_mode_enabled():
-            return True
         token = self.server.auth_token
         if not token:
             remote = self.client_address[0]
@@ -395,9 +395,6 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
 
         audit.log("task_received", {"task_id": task_id, "length": len(user_text)})
 
-        if _harness_mode_enabled():
-            return _harness_task_result(task_id, user_text)
-
         if task_queue.pending_count() >= _MAX_PENDING:
             return {
                 "id": task_id,
@@ -480,7 +477,10 @@ class A2AServer(ThreadingHTTPServer):
             "A2A_AGENT_DESCRIPTION", "A self-improving AI agent powered by Hermes"
         )
         self.auth_token = os.getenv("A2A_AUTH_TOKEN", "")
-        self.limiter = RateLimiter()
+        self.limiter = RateLimiter(
+            max_requests=_RATE_LIMIT_MAX_REQUESTS,
+            window_seconds=_RATE_LIMIT_WINDOW_SECONDS,
+        )
         super().__init__((host, port), A2ARequestHandler)
 
     def build_agent_card(self) -> dict:
@@ -518,10 +518,6 @@ class A2AServer(ThreadingHTTPServer):
                 "schemes": ["bearer"] if self.auth_token else [],
             },
         }
-
-
-def _harness_mode_enabled() -> bool:
-    return os.getenv("HERMES_A2A_HARNESS_MODE", "").lower() in ("1", "true", "yes")
 
 
 def _harness_memory_path() -> Path:
