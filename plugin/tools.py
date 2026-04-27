@@ -11,7 +11,9 @@ from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT = 30
+_DEFAULT_TIMEOUT = 600
+_BUSY_RETRY_DELAY = 5
+_BUSY_RETRY_MAX = 6
 _MAX_RESPONSE_SIZE = 100_000
 _RATE_LIMIT_WINDOW = 60
 _RATE_LIMIT_MAX_CALLS = 30
@@ -206,12 +208,28 @@ def handle_call(args: dict, **kwargs) -> str:
     def _post(payload):
         return _http_request("POST", url.rstrip("/"), json_body=payload, headers=headers)
 
+    def _is_busy(rpc_err: dict | None) -> bool:
+        if not rpc_err:
+            return False
+        msg = (rpc_err.get("message") or "").lower()
+        return "busy" in msg or "execution is busy" in msg
+
     try:
-        result = _post(modern_payload)
-        rpc_error = result.get("error")
-        # Method not found → peer is legacy Hermes; retry with tasks/send.
-        if rpc_error and rpc_error.get("code") == -32601:
-            result = _post(legacy_payload)
+        # Modern message/send first; fall back to tasks/send on Method Not Found.
+        # Retry with backoff if peer reports busy (single-instance executors
+        # like agent-mux serialize tasks; second call needs to wait).
+        attempts = 0
+        while True:
+            result = _post(modern_payload)
+            rpc_error = result.get("error")
+            if rpc_error and rpc_error.get("code") == -32601:
+                result = _post(legacy_payload)
+                rpc_error = result.get("error")
+            if _is_busy(rpc_error) and attempts < _BUSY_RETRY_MAX:
+                attempts += 1
+                time.sleep(_BUSY_RETRY_DELAY)
+                continue
+            break
     except ConnectionError:
         return _err(f"Cannot connect to {url}")
     except TimeoutError:
