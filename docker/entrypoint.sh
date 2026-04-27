@@ -88,6 +88,13 @@ if [ -d /opt/hermes-skills ]; then
     rm -rf "$dest"
     cp -r "$src" "$dest"
   done
+  # cp runs as root (entrypoint stage) but Hermes drops privileges to the
+  # `hermes` user before serving. Chown the synced tree + parent dir so
+  # skill_manage's atomic-write/mkdir don't hit EACCES on built-in skills
+  # and on creating new skills under threads/.
+  if id -u hermes >/dev/null 2>&1; then
+    chown -R hermes:hermes "$HERMES_HOME/skills/threads"
+  fi
   echo "[entrypoint] synced $(ls /opt/hermes-skills/threads 2>/dev/null | wc -l) external skills into $HERMES_HOME/skills/threads/"
 fi
 
