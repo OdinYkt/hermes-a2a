@@ -203,17 +203,24 @@ def _on_pre_llm_call(conversation_history=None, user_message=None, **kwargs):
 
 
 def _on_post_llm_call(assistant_response=None, **kwargs):
-    """Capture response and route back to the active A2A task."""
+    """Capture response and route back to the active A2A task.
+
+    Only clears _active_a2a_tasks when the agent actually emitted text
+    (final turn). Tool-only turns (assistant_response empty/whitespace)
+    must keep the active task registered, otherwise pre_llm_call's
+    exclude-set goes empty, the task stays in _pending forever, and
+    sync callers / tasks_get pollers see state=working indefinitely."""
+    if not assistant_response:
+        return
+    response_text = assistant_response if isinstance(assistant_response, str) else str(assistant_response)
+    if not response_text.strip():
+        return
+
     with _active_tasks_lock:
         if not _active_a2a_tasks:
             return
         snapshot = dict(_active_a2a_tasks)
         _active_a2a_tasks.clear()
-
-    if not assistant_response:
-        return
-
-    response_text = assistant_response if isinstance(assistant_response, str) else str(assistant_response)
 
     for task_id, info in snapshot.items():
         task_queue.complete(task_id, response_text)
