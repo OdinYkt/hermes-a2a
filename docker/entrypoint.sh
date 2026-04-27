@@ -65,6 +65,15 @@ export no_proxy="$NO_PROXY"
 
 mkdir -p "$HERMES_HOME"
 
+# Persistent single-session semantics: Hermes auto-suspends recently-active
+# sessions on startup if the previous gateway didn't write a clean-shutdown
+# marker (#7536 in-flight protection). SIGTERM on container restart usually
+# doesn't make it through the drain in time, so the next call sees the prior
+# session as suspended and creates a brand-new session_id, dropping all
+# memory of pre-restart turns. We run a single user / single agent and want
+# sessions to outlive any restart, so we always pre-write the marker.
+touch "$HERMES_HOME/.clean_shutdown"
+
 # External skills are bind-mounted ro at /opt/hermes-skills (so source-of-
 # truth in the parent repo stays read-only). Hermes' skill_manage tool
 # does atomic writes to the skill directory, which fails on a ro bind

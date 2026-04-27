@@ -128,8 +128,13 @@ def _derive_session_chat_id(metadata: dict | None) -> str:
     return _STATIC_SESSION_CHAT_ID
 
 
-def _trigger_webhook(metadata: dict | None = None):
-    """POST to the internal webhook to trigger an agent turn."""
+def _trigger_webhook(metadata: dict | None = None, task_text: str | None = None, task_id: str | None = None):
+    """POST to the internal webhook to trigger an agent turn.
+
+    Includes the task text + id in the body so the webhook prompt template
+    ({__raw__}) substitutes them into the user message that gets written to
+    the session transcript. Without this, only the wake stub lands in JSONL
+    and the LLM has no record of past user requests after a restart."""
     secret = os.getenv("A2A_WEBHOOK_SECRET", "")
     if not secret:
         return
@@ -138,10 +143,27 @@ def _trigger_webhook(metadata: dict | None = None):
     attempts = int(os.getenv("A2A_WEBHOOK_TRIGGER_ATTEMPTS", "30"))
     delay = float(os.getenv("A2A_WEBHOOK_TRIGGER_DELAY", "1"))
     session_chat_id = _derive_session_chat_id(metadata)
-    body = json.dumps({
+    body_payload: dict = {
         "event_type": "a2a_inbound",
         "session_chat_id": session_chat_id,
-    }).encode()
+    }
+    if task_id is not None:
+        body_payload["task_id"] = task_id
+    if task_text is not None:
+        # Truncate to keep the wake prompt bounded — full text still lives
+        # in the task queue for the plugin to inject as conversation context.
+        body_payload["task_text"] = task_text[:4000]
+    if metadata:
+        sender = metadata.get("sender_name")
+        if sender:
+            body_payload["sender_name"] = sender
+        kind = metadata.get("kind")
+        if kind:
+            body_payload["kind"] = kind
+        corr = metadata.get("correlation_id")
+        if corr:
+            body_payload["correlation_id"] = corr
+    body = json.dumps(body_payload).encode()
     sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
     # X-Request-ID needs to be unique per call (idempotency dedup) but can
@@ -334,7 +356,11 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
 
         task = task_queue.enqueue(task_id, user_text, metadata)
 
-        threading.Thread(target=_trigger_webhook, args=(metadata,), daemon=True).start()
+        threading.Thread(
+            target=_trigger_webhook,
+            kwargs={"metadata": metadata, "task_text": user_text, "task_id": task_id},
+            daemon=True,
+        ).start()
 
         # Async submit: caller asked to fire-and-forget. Return task_id
         # immediately; caller polls with tasks/get or waits for callback.
