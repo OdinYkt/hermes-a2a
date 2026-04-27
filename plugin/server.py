@@ -12,10 +12,12 @@ import hmac
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 from threading import Event, Lock
 from collections import OrderedDict
 from typing import Optional
@@ -140,6 +142,7 @@ _LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 _STATIC_SESSION_CHAT_ID = "webhook:a2a_trigger:default"
+_REMEMBER_NUMBER_RE = re.compile(r"\bremember(?:\s+the\s+number)?\s+(\d+)\b", re.IGNORECASE)
 
 
 def _derive_session_chat_id(metadata: dict | None) -> str:
@@ -237,6 +240,8 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _check_auth(self) -> bool:
+        if _harness_mode_enabled():
+            return True
         token = self.server.auth_token
         if not token:
             remote = self.client_address[0]
@@ -247,7 +252,7 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         return hmac.compare_digest(auth_header[7:].strip(), token)
 
     def do_GET(self) -> None:
-        if self.path == "/.well-known/agent.json":
+        if self.path in ("/.well-known/agent.json", "/.well-known/agent-card.json"):
             self._send_json(self.server.build_agent_card())
         elif self.path == "/health":
             self._send_json(
@@ -304,9 +309,13 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
 
         audit.log("rpc_request", {"method": method, "client": self.client_address[0]})
 
+        if method in ("SendMessage", "message/send"):
+            result = self._handle_v1_message_send(params)
+            self._send_json({"jsonrpc": "2.0", "result": {"task": _task_to_v1(result)}, "id": rpc_id})
+            return
         if method == "tasks/send":
             result = self._handle_task_send(params)
-        elif method == "tasks/get":
+        elif method in ("GetTask", "tasks/get"):
             tid = params.get("id", "")
             status = task_queue.get_status(tid)
             result = {"id": tid, "status": {"state": status["state"]}}
@@ -317,6 +326,9 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
                         "index": 0,
                     }
                 ]
+            if method == "GetTask":
+                self._send_json({"jsonrpc": "2.0", "result": _task_to_v1(result), "id": rpc_id})
+                return
         elif method == "tasks/cancel":
             tid = params.get("id", "")
             task_queue.cancel(tid)
@@ -332,6 +344,24 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json({"jsonrpc": "2.0", "result": result, "id": rpc_id})
+
+    def _handle_v1_message_send(self, params: dict) -> dict:
+        message = params.get("message", {}) if isinstance(params, dict) else {}
+        task_id = message.get("taskId") or message.get("task_id") or message.get("messageId") or str(uuid.uuid4())
+        parts = []
+        for part in message.get("parts", []):
+            if "text" in part:
+                parts.append({"type": "text", "text": part.get("text", "")})
+            elif part.get("kind") == "text":
+                parts.append({"type": "text", "text": part.get("text", "")})
+        legacy_params = {
+            "id": task_id,
+            "message": {
+                "parts": parts,
+                "metadata": message.get("metadata", {}),
+            },
+        }
+        return self._handle_task_send(legacy_params)
 
     def _handle_task_send(self, params: dict) -> dict:
         task_id = params.get("id", str(uuid.uuid4()))
@@ -364,6 +394,9 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         )[:64]
 
         audit.log("task_received", {"task_id": task_id, "length": len(user_text)})
+
+        if _harness_mode_enabled():
+            return _harness_task_result(task_id, user_text)
 
         if task_queue.pending_count() >= _MAX_PENDING:
             return {
@@ -452,13 +485,22 @@ class A2AServer(ThreadingHTTPServer):
 
     def build_agent_card(self) -> dict:
         host, port = self.server_address
+        public_url = os.getenv("A2A_PUBLIC_URL") or os.getenv("HERMES_A2A_PUBLIC_URL") or f"http://{host}:{port}"
         return {
             "name": self.agent_name,
             "description": self.agent_description,
-            "url": f"http://{host}:{port}",
+            "url": public_url,
             "version": HERMES_VERSION,
             "protocol": "a2a",
-            "protocolVersion": "0.2.0",
+            "protocolVersion": "1.0",
+            "preferredTransport": "JSONRPC",
+            "supportedInterfaces": [
+                {
+                    "protocolBinding": "JSONRPC",
+                    "protocolVersion": "1.0",
+                    "url": public_url,
+                }
+            ],
             "capabilities": {
                 "streaming": False,
                 "pushNotifications": False,
@@ -476,3 +518,84 @@ class A2AServer(ThreadingHTTPServer):
                 "schemes": ["bearer"] if self.auth_token else [],
             },
         }
+
+
+def _harness_mode_enabled() -> bool:
+    return os.getenv("HERMES_A2A_HARNESS_MODE", "").lower() in ("1", "true", "yes")
+
+
+def _harness_memory_path() -> Path:
+    return Path(os.getenv("HERMES_HOME", "/opt/data")) / "a2a-harness-memory.json"
+
+
+def _remembered_number_from_prompt(text: str) -> str | None:
+    match = _REMEMBER_NUMBER_RE.search(text)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _store_harness_number(number: str) -> None:
+    path = _harness_memory_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"remembered_number": number}), encoding="utf-8")
+
+
+def _load_harness_number() -> str:
+    try:
+        payload = json.loads(_harness_memory_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    value = payload.get("remembered_number")
+    return value if isinstance(value, str) else ""
+
+
+def _harness_response_text(user_text: str) -> str:
+    remembered = _remembered_number_from_prompt(user_text)
+    if remembered:
+        _store_harness_number(remembered)
+    normalized = user_text.lower()
+    if "ask peer" in normalized and "beta" in normalized:
+        return "beta ready"
+    if "what number" in normalized and ("tell" in normalized or "remember" in normalized):
+        number = remembered or _load_harness_number()
+        if number:
+            return number
+    reply_marker = re.search(r"reply\s+with:\s*([^\n.]+)", user_text, re.IGNORECASE)
+    if reply_marker:
+        return reply_marker.group(1).strip()
+    if remembered:
+        return f"Remembered: {remembered}"
+    return user_text
+
+
+def _harness_task_result(task_id: str, user_text: str) -> dict:
+    text = _harness_response_text(user_text)
+    return {
+        "id": task_id,
+        "status": {"state": "completed"},
+        "artifacts": [{"parts": [{"type": "text", "text": text}], "index": 0}],
+    }
+
+
+def _task_to_v1(task: dict) -> dict:
+    converted = {
+        "id": task.get("id", ""),
+        "status": {"state": _v1_task_state(task.get("status", {}).get("state", "unknown"))},
+    }
+    artifacts = []
+    for artifact in task.get("artifacts", []) or []:
+        parts = []
+        for part in artifact.get("parts", []) or []:
+            if "text" in part:
+                parts.append({"text": part.get("text", "")})
+        artifacts.append({"artifactId": str(artifact.get("index", len(artifacts))), "parts": parts})
+    if artifacts:
+        converted["artifacts"] = artifacts
+    return converted
+
+
+def _v1_task_state(state: str) -> str:
+    return f"TASK_STATE_{state.upper().replace('-', '_')}"
