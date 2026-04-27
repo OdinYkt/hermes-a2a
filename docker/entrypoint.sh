@@ -65,6 +65,23 @@ export no_proxy="$NO_PROXY"
 
 mkdir -p "$HERMES_HOME"
 
+# External skills are bind-mounted ro at /opt/hermes-skills (so source-of-
+# truth in the parent repo stays read-only). Hermes' skill_manage tool
+# does atomic writes to the skill directory, which fails on a ro bind
+# mount. Copy them into HERMES_HOME's writable skills/threads/ subtree on
+# every boot — fresh source on restart, transient edits during runtime.
+if [ -d /opt/hermes-skills ]; then
+  mkdir -p "$HERMES_HOME/skills/threads"
+  for src in /opt/hermes-skills/threads/*; do
+    [ -d "$src" ] || continue
+    name="$(basename "$src")"
+    dest="$HERMES_HOME/skills/threads/$name"
+    rm -rf "$dest"
+    cp -r "$src" "$dest"
+  done
+  echo "[entrypoint] synced $(ls /opt/hermes-skills/threads 2>/dev/null | wc -l) external skills into $HERMES_HOME/skills/threads/"
+fi
+
 # Patch upstream Hermes webhook.py so payload['session_chat_id'] becomes the
 # session key (instead of always per-delivery_id). Lets the a2a plugin pin all
 # messages from one TG sender / peer to the same Hermes session. Idempotent.
