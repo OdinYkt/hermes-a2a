@@ -128,9 +128,10 @@ def handle_discover(args: dict, **kwargs) -> str:
 def _peer_session_id(peer_name: str) -> str:
     """Static per-peer session anchor so the callee binds every inbound from
     us into one persistent agent session (cc keeps one Claude session for us;
-    dev/qa keep one opencode session for us)."""
-    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in (peer_name or "").lower())
-    return f"hermes-{safe or 'peer'}-session"
+    dev/qa keep one opencode session for us). Uses 'ses_' prefix because
+    opencode-a2a validates that format on metadata.shared.session.id."""
+    safe = "".join(c if c.isalnum() or c == "_" else "_" for c in (peer_name or "").lower())
+    return f"ses_hermes_{safe or 'peer'}_persistent"
 
 
 def _resolve_peer(name: str, url: str) -> tuple[str, str | None]:
