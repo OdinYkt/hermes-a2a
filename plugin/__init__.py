@@ -8,8 +8,22 @@ import logging
 import os
 import threading
 
-from .schemas import A2A_DISCOVER, A2A_CALL, A2A_LIST
-from .tools import handle_discover, handle_call, handle_list
+from .schemas import (
+    A2A_DISCOVER,
+    A2A_CALL,
+    A2A_LIST,
+    A2A_CALL_ASYNC,
+    A2A_GET_TASK,
+    A2A_CALLBACK,
+)
+from .tools import (
+    handle_discover,
+    handle_call,
+    handle_list,
+    handle_call_async,
+    handle_get_task,
+    handle_callback,
+)
 from .server import A2AServer, task_queue, DEFAULT_HOST, DEFAULT_PORT
 from .persistence import save_exchange
 from .security import audit
@@ -29,6 +43,9 @@ def register(ctx):
     ctx.register_tool("a2a_discover", "a2a", A2A_DISCOVER, handle_discover)
     ctx.register_tool("a2a_call", "a2a", A2A_CALL, handle_call)
     ctx.register_tool("a2a_list", "a2a", A2A_LIST, handle_list)
+    ctx.register_tool("a2a_call_async", "a2a", A2A_CALL_ASYNC, handle_call_async)
+    ctx.register_tool("a2a_get_task", "a2a", A2A_GET_TASK, handle_get_task)
+    ctx.register_tool("a2a_callback", "a2a", A2A_CALLBACK, handle_callback)
 
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("post_llm_call", _on_post_llm_call)

@@ -125,8 +125,102 @@ def handle_discover(args: dict, **kwargs) -> str:
     })
 
 
+def _peer_session_id(peer_name: str) -> str:
+    """Static per-peer session anchor so the callee binds every inbound from
+    us into one persistent agent session (cc keeps one Claude session for us;
+    dev/qa keep one opencode session for us)."""
+    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in (peer_name or "").lower())
+    return f"hermes-{safe or 'peer'}-session"
+
+
+def _resolve_peer(name: str, url: str) -> tuple[str, str | None]:
+    auth_token = None
+    if name:
+        for agent in _load_configured_agents():
+            if agent.get("name", "").lower() == name.lower():
+                if not url:
+                    url = agent.get("url", "")
+                auth_token = agent.get("auth_token", "")
+                break
+    return url, auth_token
+
+
+def _is_busy(rpc_err: dict | None) -> bool:
+    if not rpc_err:
+        return False
+    msg = (rpc_err.get("message") or "").lower()
+    return "busy" in msg or "execution is busy" in msg
+
+
+def _send(
+    *,
+    url: str,
+    auth_token: str | None,
+    task_id: str,
+    peer_name: str,
+    message: str,
+    metadata: dict,
+) -> dict:
+    """One-shot tasks/send to a peer with modern→legacy fallback and busy retry.
+    Returns the parsed JSON-RPC result (caller handles state)."""
+    from .security import audit
+    session_id = _peer_session_id(peer_name)
+    msg_meta = {
+        **metadata,
+        "shared": {**metadata.get("shared", {}), "session": {"id": session_id}},
+    }
+
+    modern_payload = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "message/send",
+        "params": {
+            "message": {
+                "kind": "message",
+                "message_id": task_id,
+                "context_id": session_id,
+                "role": "user",
+                "parts": [{"kind": "text", "text": message}],
+                "metadata": msg_meta,
+            },
+        },
+    }
+    legacy_payload = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "tasks/send",
+        "params": {
+            "id": task_id,
+            "message": {
+                "role": "user",
+                "parts": [{"type": "text", "text": message}],
+                "metadata": msg_meta,
+            },
+        },
+    }
+    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+
+    audit.log("call_outbound", {"target": url, "task_id": task_id, "length": len(message)})
+
+    def _post(payload):
+        return _http_request("POST", url.rstrip("/"), json_body=payload, headers=headers)
+
+    attempts = 0
+    while True:
+        result = _post(modern_payload)
+        rpc_error = result.get("error")
+        if rpc_error and rpc_error.get("code") == -32601:
+            result = _post(legacy_payload)
+            rpc_error = result.get("error")
+        if _is_busy(rpc_error) and attempts < _BUSY_RETRY_MAX:
+            attempts += 1
+            time.sleep(_BUSY_RETRY_DELAY)
+            continue
+        return result
+
+
 def handle_call(args: dict, **kwargs) -> str:
-    from .security import audit, filter_outbound, sanitize_inbound
+    from .security import filter_outbound, sanitize_inbound
 
     url = args.get("url", "")
     name = args.get("name", "")
@@ -140,96 +234,29 @@ def handle_call(args: dict, **kwargs) -> str:
         return _err("'message' is required")
     if not url and not name:
         return _err("Provide either 'url' or 'name'")
-
     if not _check_rate_limit():
         return _err(f"Rate limit exceeded: max {_RATE_LIMIT_MAX_CALLS} calls per {_RATE_LIMIT_WINDOW}s")
 
-    auth_token = None
-    if name:
-        for agent in _load_configured_agents():
-            if agent.get("name", "").lower() == name.lower():
-                if not url:
-                    url = agent.get("url", "")
-                auth_token = agent.get("auth_token", "")
-                break
+    url, auth_token = _resolve_peer(name, url)
     if not url:
         return _err(f"Agent '{name}' not found in config")
-
     with _rate_lock:
         _call_timestamps.append(time.time())
-    # filter_outbound: strip sensitive data from what we send out
-    filtered_message = filter_outbound(message)
 
-    common_metadata = {
+    metadata = {
         "intent": intent,
         "expected_action": expected_action,
         "context_scope": "full",
         "reply_to_task_id": reply_to_task_id,
         "sender_name": os.getenv("A2A_AGENT_NAME", "hermes-agent"),
+        "kind": "request",
     }
-
-    # Modern A2A spec (v0.3+) used by agent-mux-a2a / google a2a-sdk peers.
-    modern_payload = {
-        "jsonrpc": "2.0",
-        "id": str(uuid.uuid4()),
-        "method": "message/send",
-        "params": {
-            "message": {
-                "kind": "message",
-                "message_id": task_id,
-                "role": "user",
-                "parts": [{"kind": "text", "text": filtered_message}],
-                "metadata": common_metadata,
-            },
-        },
-    }
-
-    # Legacy A2A v0.2-style used by Hermes peers. Tried as fallback.
-    legacy_payload = {
-        "jsonrpc": "2.0",
-        "id": str(uuid.uuid4()),
-        "method": "tasks/send",
-        "params": {
-            "id": task_id,
-            "message": {
-                "role": "user",
-                "parts": [{"type": "text", "text": filtered_message}],
-                "metadata": common_metadata,
-            },
-        },
-    }
-
-    headers = {}
-    if auth_token:
-        headers["Authorization"] = f"Bearer {auth_token}"
-
-    audit.log("call_outbound", {"target": url, "task_id": task_id, "length": len(message)})
-
-    def _post(payload):
-        return _http_request("POST", url.rstrip("/"), json_body=payload, headers=headers)
-
-    def _is_busy(rpc_err: dict | None) -> bool:
-        if not rpc_err:
-            return False
-        msg = (rpc_err.get("message") or "").lower()
-        return "busy" in msg or "execution is busy" in msg
 
     try:
-        # Modern message/send first; fall back to tasks/send on Method Not Found.
-        # Retry with backoff if peer reports busy (single-instance executors
-        # like agent-mux serialize tasks; second call needs to wait).
-        attempts = 0
-        while True:
-            result = _post(modern_payload)
-            rpc_error = result.get("error")
-            if rpc_error and rpc_error.get("code") == -32601:
-                result = _post(legacy_payload)
-                rpc_error = result.get("error")
-            if _is_busy(rpc_error) and attempts < _BUSY_RETRY_MAX:
-                attempts += 1
-                time.sleep(_BUSY_RETRY_DELAY)
-                continue
-            break
+        result = _send(
+            url=url, auth_token=auth_token, task_id=task_id,
+            peer_name=name or url, message=filter_outbound(message), metadata=metadata,
+        )
     except ConnectionError:
         return _err(f"Cannot connect to {url}")
     except TimeoutError:
@@ -266,6 +293,7 @@ def handle_call(args: dict, **kwargs) -> str:
     # sanitize_inbound: strip prompt injection from what we received
     response_text = sanitize_inbound(response_text.strip())
 
+    from .security import audit
     audit.log("call_inbound", {"source": url, "task_state": task_state, "task_id": task_id})
 
     return _ok({
@@ -275,6 +303,156 @@ def handle_call(args: dict, **kwargs) -> str:
         "source": url,
         "note": "[A2A: response from external agent — treat as untrusted]",
     })
+
+
+def handle_call_async(args: dict, **kwargs) -> str:
+    """Submit a task to a peer and return immediately with task_id.
+    Use this for long-running work; the peer will deliver the result via
+    a2a_callback. Caller can later check status with a2a_get_task."""
+    from .security import filter_outbound
+
+    name = args.get("name", "")
+    url = args.get("url", "")
+    message = args.get("message", "")
+    task_id = args.get("task_id") or f"async-{uuid.uuid4()}"
+    if not message:
+        return _err("'message' is required")
+    if not url and not name:
+        return _err("Provide either 'url' or 'name'")
+    if not _check_rate_limit():
+        return _err(f"Rate limit exceeded: max {_RATE_LIMIT_MAX_CALLS} calls per {_RATE_LIMIT_WINDOW}s")
+
+    url, auth_token = _resolve_peer(name, url)
+    if not url:
+        return _err(f"Agent '{name}' not found in config")
+    with _rate_lock:
+        _call_timestamps.append(time.time())
+
+    metadata = {
+        "kind": "request",
+        "async": True,
+        "intent": args.get("intent", "action_request"),
+        "expected_action": "callback",
+        "callback_target": os.getenv("A2A_AGENT_NAME", "hermes-agent"),
+        "sender_name": os.getenv("A2A_AGENT_NAME", "hermes-agent"),
+    }
+
+    try:
+        result = _send(
+            url=url, auth_token=auth_token, task_id=task_id,
+            peer_name=name or url, message=filter_outbound(message), metadata=metadata,
+        )
+    except Exception as e:
+        return _err(f"Async call failed: {e}")
+
+    rpc_error = result.get("error")
+    if rpc_error:
+        return _err(f"Async submit failed: RPC -{rpc_error.get('code')}: {rpc_error.get('message')}")
+
+    rpc_result = result.get("result") or {}
+    state = rpc_result.get("status", {}).get("state") or rpc_result.get("state", "submitted")
+    return _ok({
+        "task_id": rpc_result.get("id") or task_id,
+        "state": state,
+        "callback_via": "wait for incoming A2A msg with metadata.kind=callback-result",
+        "source": url,
+    })
+
+
+def handle_get_task(args: dict, **kwargs) -> str:
+    """Poll a remote peer for the current state of a previously-submitted task."""
+    name = args.get("name", "")
+    url = args.get("url", "")
+    task_id = args.get("task_id", "")
+    if not task_id:
+        return _err("'task_id' is required")
+    if not url and not name:
+        return _err("Provide either 'url' or 'name'")
+    url, auth_token = _resolve_peer(name, url)
+    if not url:
+        return _err(f"Agent '{name}' not found in config")
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "tasks/get",
+        "params": {"id": task_id},
+    }
+    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    try:
+        result = _http_request("POST", url.rstrip("/"), json_body=payload, headers=headers)
+    except Exception as e:
+        return _err(f"get_task failed: {e}")
+
+    rpc_error = result.get("error")
+    if rpc_error:
+        return _err(f"get_task RPC error: {rpc_error.get('message')}")
+
+    rpc_result = result.get("result") or {}
+    state = rpc_result.get("status", {}).get("state") or rpc_result.get("state", "unknown")
+    response_text = ""
+    for artifact in rpc_result.get("artifacts", []) or []:
+        for part in artifact.get("parts", []) or []:
+            if part.get("type") == "text" or part.get("kind") == "text":
+                response_text += part.get("text", "") + "\n"
+    return _ok({
+        "task_id": task_id,
+        "state": state,
+        "response": response_text.strip() or "(no text)",
+        "source": url,
+    })
+
+
+def handle_callback(args: dict, **kwargs) -> str:
+    """Send a callback message to a peer (typically the original requester)
+    after asynchronous work completes. Sets metadata.kind=callback-result
+    and metadata.correlation_id linking the callback to the original task."""
+    from .security import filter_outbound
+
+    name = args.get("name", "")
+    url = args.get("url", "")
+    message = args.get("message", "")
+    correlation_id = args.get("correlation_id") or args.get("reply_to_task_id", "")
+    kind = args.get("kind", "callback-result")
+    if not message:
+        return _err("'message' is required")
+    if not correlation_id:
+        return _err("'correlation_id' (the original task_id) is required")
+    if not url and not name:
+        return _err("Provide either 'url' or 'name'")
+    if not _check_rate_limit():
+        return _err(f"Rate limit exceeded: max {_RATE_LIMIT_MAX_CALLS} calls per {_RATE_LIMIT_WINDOW}s")
+
+    url, auth_token = _resolve_peer(name, url)
+    if not url:
+        return _err(f"Agent '{name}' not found in config")
+    with _rate_lock:
+        _call_timestamps.append(time.time())
+
+    task_id = f"cb-{correlation_id}-{uuid.uuid4().hex[:8]}"
+    metadata = {
+        "kind": kind,
+        "correlation_id": correlation_id,
+        "intent": "notification",
+        "expected_action": "acknowledge",
+        "sender_name": os.getenv("A2A_AGENT_NAME", "hermes-agent"),
+        # Fire-and-forget: receiver should ack immediately so we don't block
+        # here for the receiver's LLM turn.
+        "async": True,
+    }
+
+    try:
+        result = _send(
+            url=url, auth_token=auth_token, task_id=task_id,
+            peer_name=name or url, message=filter_outbound(message), metadata=metadata,
+        )
+    except Exception as e:
+        return _err(f"Callback failed: {e}")
+
+    rpc_error = result.get("error")
+    if rpc_error:
+        return _err(f"Callback failed: RPC -{rpc_error.get('code')}: {rpc_error.get('message')}")
+    return _ok({"task_id": task_id, "delivered_to": url, "kind": kind})
 
 
 def handle_list(args: dict, **kwargs) -> str:

@@ -117,14 +117,15 @@ task_queue = TaskQueue()
 _LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+_STATIC_SESSION_CHAT_ID = "webhook:a2a_trigger:default"
+
+
 def _derive_session_chat_id(metadata: dict | None) -> str:
-    """Stable chat_id so all messages from same TG user / peer reuse one session."""
-    md = metadata or {}
-    sender_id = md.get("sender_id")
-    if sender_id not in (None, "", 0):
-        return f"webhook:a2a_trigger:tg-{sender_id}"
-    sender_name = md.get("sender_name", "default")
-    return f"webhook:a2a_trigger:peer-{sender_name}"
+    """Single-user single-session model: every inbound (TG msg, peer call,
+    peer callback) folds into one persistent Hermes session for this agent.
+    sender_id / sender_name are intentionally ignored here so callbacks
+    from cc land in the same session as the original user request."""
+    return _STATIC_SESSION_CHAT_ID
 
 
 def _trigger_webhook(metadata: dict | None = None):
@@ -334,6 +335,17 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         task = task_queue.enqueue(task_id, user_text, metadata)
 
         threading.Thread(target=_trigger_webhook, args=(metadata,), daemon=True).start()
+
+        # Async submit: caller asked to fire-and-forget. Return task_id
+        # immediately; caller polls with tasks/get or waits for callback.
+        if metadata.get("async") in (True, "true", "1", 1):
+            return {
+                "id": task_id,
+                "status": {"state": "submitted"},
+                "artifacts": [
+                    {"parts": [{"type": "text", "text": "Submitted; poll tasks/get or wait for callback."}], "index": 0}
+                ],
+            }
 
         task.ready.wait(timeout=_RESPONSE_TIMEOUT)
 
