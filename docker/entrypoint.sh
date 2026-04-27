@@ -74,28 +74,24 @@ mkdir -p "$HERMES_HOME"
 # sessions to outlive any restart, so we always pre-write the marker.
 touch "$HERMES_HOME/.clean_shutdown"
 
-# External skills are bind-mounted ro at /opt/hermes-skills (so source-of-
-# truth in the parent repo stays read-only). Hermes' skill_manage tool
-# does atomic writes to the skill directory, which fails on a ro bind
-# mount. Copy them into HERMES_HOME's writable skills/threads/ subtree on
-# every boot — fresh source on restart, transient edits during runtime.
-if [ -d /opt/hermes-skills ]; then
-  mkdir -p "$HERMES_HOME/skills/threads"
-  for src in /opt/hermes-skills/threads/*; do
-    [ -d "$src" ] || continue
-    name="$(basename "$src")"
-    dest="$HERMES_HOME/skills/threads/$name"
-    rm -rf "$dest"
-    cp -r "$src" "$dest"
-  done
-  # cp runs as root (entrypoint stage) but Hermes drops privileges to the
-  # `hermes` user before serving. Chown the synced tree + parent dir so
-  # skill_manage's atomic-write/mkdir don't hit EACCES on built-in skills
-  # and on creating new skills under threads/.
-  if id -u hermes >/dev/null 2>&1; then
-    chown -R hermes:hermes "$HERMES_HOME/skills/threads"
-  fi
-  echo "[entrypoint] synced $(ls /opt/hermes-skills/threads 2>/dev/null | wc -l) external skills into $HERMES_HOME/skills/threads/"
+# External (bundled) skills live RO at /opt/hermes-skills and are wired in
+# via the `skills.external_dirs` config field — Hermes scans them for
+# discovery and refuses to mutate them, while user/agent-created skills
+# go into the primary writable HERMES_HOME/skills/ via skill_manage's
+# create flow. Make sure the primary dir exists and is owned by hermes
+# so create_skill / patch_skill don't hit EACCES.
+mkdir -p "$HERMES_HOME/skills"
+if id -u hermes >/dev/null 2>&1; then
+  chown hermes:hermes "$HERMES_HOME/skills" || true
+fi
+
+# One-shot migration cleanup: prior versions copied bundled skills into
+# $HERMES_HOME/skills/threads/. Now bundled skills are exposed RO via
+# skills.external_dirs in config.yaml — leaving the old copy creates a
+# parallel writable shadow that can drift from the RO source. Drop it.
+if [ -d "$HERMES_HOME/skills/threads" ]; then
+  rm -rf "$HERMES_HOME/skills/threads"
+  echo "[entrypoint] removed legacy $HERMES_HOME/skills/threads/ (now served RO via external_dirs)"
 fi
 
 # Patch upstream Hermes webhook.py so payload['session_chat_id'] becomes the
