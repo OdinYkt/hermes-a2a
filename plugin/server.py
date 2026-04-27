@@ -78,6 +78,28 @@ class TaskQueue:
                 return [t for t in self._pending.values() if t.task_id not in exclude]
             return list(self._pending.values())
 
+    def get_pending(self, task_id: str) -> Optional["_PendingTask"]:
+        with self._lock:
+            return self._pending.get(task_id)
+
+    def ensure_pending(self, task_id: str, text: str, metadata: dict) -> "_PendingTask":
+        """Idempotent enqueue: returns existing pending entry if present,
+        otherwise registers a fresh one. Used by pre_llm_call when the
+        webhook payload references a task_id whose in-memory _PendingTask
+        was lost (e.g. after a container restart) — without this fallback
+        the wake event would observe an empty queue and never finalize."""
+        with self._lock:
+            existing = self._pending.get(task_id)
+            if existing:
+                return existing
+            task = _PendingTask(task_id, text, metadata)
+            self._pending[task_id] = task
+            while len(self._pending) > _TASK_CACHE_MAX:
+                _, old = self._pending.popitem(last=False)
+                old.response = "(dropped — queue overflow)"
+                old.ready.set()
+            return task
+
     def complete(self, task_id: str, response: str) -> None:
         with self._lock:
             task = self._pending.pop(task_id, None)
@@ -166,15 +188,21 @@ def _trigger_webhook(metadata: dict | None = None, task_text: str | None = None,
     body = json.dumps(body_payload).encode()
     sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
-    # X-Request-ID needs to be unique per call (idempotency dedup) but can
-    # carry the stable session_chat_id as a prefix for traceability.
+    # X-Request-ID needs to be globally unique because Hermes' webhook
+    # adapter idempotency-dedups on it. Concurrent triggers (multiple
+    # peers calling at once) hit the same millisecond on time.time(), so
+    # using a wallclock-only id collides and silently drops events. The
+    # task_id is already unique per inbound A2A request — make it the
+    # primary key, with a millisecond suffix to keep retried trigger
+    # attempts from the same task_id coalescing into one delivery.
+    req_id_base = task_id if task_id else session_chat_id
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/webhooks/a2a_trigger",
         data=body,
         headers={
             "Content-Type": "application/json",
             "X-Hub-Signature-256": sig,
-            "X-Request-ID": f"{session_chat_id}-{int(time.time()*1000)}",
+            "X-Request-ID": f"{req_id_base}-{int(time.time()*1000)}",
         },
         method="POST",
     )

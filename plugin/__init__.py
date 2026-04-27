@@ -4,8 +4,10 @@ Registers tools, hooks, and a background HTTP server for A2A protocol support.
 No gateway patch needed — drop into ~/.hermes/plugins/a2a/ and restart.
 """
 
+import json
 import logging
 import os
+import re
 import threading
 
 from .schemas import (
@@ -153,25 +155,75 @@ def _is_mid_conversation(messages) -> bool:
     return False
 
 
+_WAKE_PAYLOAD_RE = re.compile(r"\{[\s\S]*\}")
+
+
+def _extract_wake_payload(user_message) -> dict | None:
+    """Pull the JSON payload out of an `[A2A wake]` webhook prompt.
+
+    The webhook adapter wraps the plugin's POST body via the configured
+    prompt template (`[A2A wake] Process pending A2A queue.\\nPayload:\\n{__raw__}`)
+    so the LLM sees the raw payload as a JSON literal in the user turn.
+    Parsing it back here is the only authoritative way to know which
+    task_id this wake corresponds to — drain order off `_pending` is a
+    race when multiple peers fire concurrently."""
+    if not user_message:
+        return None
+    text = str(user_message)
+    if "[A2A wake]" not in text:
+        return None
+    m = _WAKE_PAYLOAD_RE.search(text)
+    if not m:
+        return None
+    try:
+        payload = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _on_pre_llm_call(conversation_history=None, user_message=None, **kwargs):
-    """Inject one pending A2A task into the current turn's context.
+    """Pin the active A2A task to whatever task_id this webhook references.
 
-    Only one task per turn so the response maps 1:1 to the task.
-    If the agent is mid-conversation (user sent a real message), hold the queue.
+    Strict 1:1 wake→task mapping. Without it pre_llm_call would inject
+    `pending[0]` (which is whichever task was enqueued first) while the
+    LLM sees the wake payload's task_text in user_message and naturally
+    answers *that* one — post_llm_call would then complete the wrong
+    task_id, leaving the real one stuck in `_pending` forever and the
+    sync caller blocked until RESPONSE_TIMEOUT.
     """
-    with _active_tasks_lock:
-        exclude = set(_active_a2a_tasks.keys())
-
-    pending = task_queue.drain_pending(exclude=exclude)
-    if not pending:
+    payload = _extract_wake_payload(user_message)
+    if not payload:
+        # Not an A2A wake event — possibly a normal user turn (TG/etc.).
+        # Don't touch the queue here; downstream paths (e.g. dispatcher
+        # fan-in) handle their own wake triggers with explicit task_ids.
         return None
 
-    if user_message and not str(user_message).startswith("[A2A"):
-        if _is_mid_conversation(conversation_history):
-            logger.debug("[A2A] Mid-conversation, holding %d pending tasks", len(pending))
+    target_task_id = payload.get("task_id")
+    if not target_task_id:
+        return None
+
+    with _active_tasks_lock:
+        if target_task_id in _active_a2a_tasks:
+            # Already mid-flight (multi-turn agent loop). Don't re-inject
+            # the header; the original active entry stays valid until
+            # post_llm_call observes the final assistant text.
             return None
 
-    task = pending[0]
+    task = task_queue.get_pending(target_task_id)
+    if task is None:
+        # Pending entry got evicted (overflow) or container restarted
+        # mid-flight: synthesize from the payload so the wake still
+        # converges to a complete()-able state. The webhook is the
+        # durable side of the protocol; the in-memory queue is just a
+        # cache for the response_text round-trip.
+        task_text = payload.get("task_text") or ""
+        synth_meta = {
+            k: payload.get(k) for k in ("sender_name", "kind", "correlation_id")
+            if payload.get(k) is not None
+        }
+        task = task_queue.ensure_pending(target_task_id, task_text, synth_meta)
+        logger.info("[A2A] Synthesized pending entry for task %s from webhook payload", target_task_id)
 
     with _active_tasks_lock:
         _active_a2a_tasks[task.task_id] = {
