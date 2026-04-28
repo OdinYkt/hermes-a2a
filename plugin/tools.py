@@ -143,6 +143,18 @@ def _resolve_peer(name: str, url: str) -> tuple[str, str | None]:
                     url = agent.get("url", "")
                 auth_token = agent.get("auth_token", "")
                 break
+    elif url:
+        # LLMs frequently pass ``url`` only (extracted from the user
+        # prompt) without ``name``. Walk the registry by URL so the
+        # auth_token still resolves — otherwise outbound calls land
+        # without ``Authorization`` and any peer requiring bearer auth
+        # rejects them.
+        target = url.rstrip("/")
+        for agent in _load_configured_agents():
+            registered = str(agent.get("url", "")).rstrip("/")
+            if registered and registered == target:
+                auth_token = agent.get("auth_token", "")
+                break
     return url, auth_token
 
 
@@ -171,7 +183,27 @@ def _send(
         "shared": {**metadata.get("shared", {}), "session": {"id": session_id}},
     }
 
-    modern_payload = {
+    # v1.0 (SendMessage / camelCase / ROLE_USER) is the modern surface;
+    # v0.3 (message/send / snake_case / "user") and the v0.2 legacy
+    # (tasks/send) follow as fallbacks for peers that have not migrated.
+    # Each payload ships with the matching A2A-Version header so the
+    # callee's version validator does not reject a v0.3 method body
+    # carrying a v1.0 advertised version (or vice versa).
+    v1_payload = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "SendMessage",
+        "params": {
+            "message": {
+                "messageId": task_id,
+                "contextId": session_id,
+                "role": "ROLE_USER",
+                "parts": [{"text": message}],
+                "metadata": msg_meta,
+            },
+        },
+    }
+    v03_payload = {
         "jsonrpc": "2.0",
         "id": str(uuid.uuid4()),
         "method": "message/send",
@@ -199,19 +231,23 @@ def _send(
             },
         },
     }
-    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    base_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
 
     audit.log("call_outbound", {"target": url, "task_id": task_id, "length": len(message)})
 
-    def _post(payload):
+    def _post(payload, version):
+        headers = {**base_headers, "A2A-Version": version}
         return _http_request("POST", url.rstrip("/"), json_body=payload, headers=headers)
 
     attempts = 0
     while True:
-        result = _post(modern_payload)
+        result = _post(v1_payload, "1.0")
         rpc_error = result.get("error")
         if rpc_error and rpc_error.get("code") == -32601:
-            result = _post(legacy_payload)
+            result = _post(v03_payload, "0.3")
+            rpc_error = result.get("error")
+        if rpc_error and rpc_error.get("code") == -32601:
+            result = _post(legacy_payload, "0.3")
             rpc_error = result.get("error")
         if _is_busy(rpc_error) and attempts < _BUSY_RETRY_MAX:
             attempts += 1
