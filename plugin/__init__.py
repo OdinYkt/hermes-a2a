@@ -209,13 +209,23 @@ def _extract_wake_payload(user_message) -> dict | None:
     if "[A2A wake]" not in text:
         return None
     m = _WAKE_PAYLOAD_RE.search(text)
-    if not m:
-        return None
-    try:
-        payload = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return None
-    return payload if isinstance(payload, dict) else None
+    if m:
+        try:
+            payload = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            return payload
+
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep != "=":
+            continue
+        key = key.strip()
+        if key in {"task_id", "task_text", "sender_name", "kind", "correlation_id"}:
+            fields[key] = value.strip()
+    return fields or None
 
 
 def _on_pre_llm_call(conversation_history=None, user_message=None, **kwargs):
@@ -230,6 +240,9 @@ def _on_pre_llm_call(conversation_history=None, user_message=None, **kwargs):
     """
     payload = _extract_wake_payload(user_message)
     if not payload:
+        if user_message and "[A2A wake]" in str(user_message):
+            audit.log("wake_payload_parse_failed", {})
+            logger.warning("[A2A] Wake payload could not be parsed")
         # Not an A2A wake event — possibly a normal user turn (TG/etc.).
         # Don't touch the queue here; downstream paths (e.g. dispatcher
         # fan-in) handle their own wake triggers with explicit task_ids.
@@ -237,6 +250,8 @@ def _on_pre_llm_call(conversation_history=None, user_message=None, **kwargs):
 
     target_task_id = payload.get("task_id")
     if not target_task_id:
+        audit.log("wake_payload_missing_task_id", {})
+        logger.warning("[A2A] Wake payload missing task_id")
         return None
 
     with _active_tasks_lock:
@@ -266,6 +281,8 @@ def _on_pre_llm_call(conversation_history=None, user_message=None, **kwargs):
             "text": task.text,
             "metadata": task.metadata,
         }
+    logger.info("[A2A] Activated inbound task %s", task.task_id)
+    audit.log("task_activated", {"task_id": task.task_id})
 
     _allowed_intents = {"action_request", "review", "consultation", "notification", "instruction", "unknown"}
     _allowed_actions = {"reply", "forward", "acknowledge"}
@@ -314,6 +331,8 @@ def _on_post_llm_call(assistant_response=None, **kwargs):
         _active_a2a_tasks.clear()
 
     for task_id, info in snapshot.items():
+        logger.info("[A2A] Completing active task %s", task_id)
+        audit.log("post_llm_completing_task", {"task_id": task_id})
         task_queue.complete(task_id, response_text)
 
         metadata = info.get("metadata", {})

@@ -4,6 +4,7 @@ Handles inbound A2A JSON-RPC requests. Messages are queued and picked up
 by the pre_llm_call hook; responses are captured by post_llm_call and
 returned to the caller.
 """
+# pyright: reportMissingImports=false
 
 from __future__ import annotations
 
@@ -12,15 +13,13 @@ import hmac
 import json
 import logging
 import os
-import re
 import threading
 import time
 import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from pathlib import Path
 from threading import Event, Lock
 from collections import OrderedDict
-from typing import Optional
+from typing import Any, Optional, cast
 import urllib.request
 import urllib.error
 
@@ -132,7 +131,7 @@ class TaskQueue:
                     return {"state": "canceled"}
                 return {
                     "state": "completed",
-                    "response": filter_outbound(task.response),
+                    "response": filter_outbound(task.response or ""),
                 }
         return {"state": "unknown"}
 
@@ -144,9 +143,6 @@ _LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 _STATIC_SESSION_CHAT_ID = "webhook:a2a_trigger:default"
-_REMEMBER_NUMBER_RE = re.compile(r"\bremember(?:\s+the\s+number)?\s+(\d+)\b", re.IGNORECASE)
-
-
 def _derive_session_chat_id(metadata: dict | None) -> str:
     """Single-user single-session model: every inbound (TG msg, peer call,
     peer callback) folds into one persistent Hermes session for this agent.
@@ -213,22 +209,26 @@ def _trigger_webhook(metadata: dict | None = None, task_text: str | None = None,
     )
     last_error = None
     for attempt in range(1, attempts + 1):
+        if attempt == 1:
+            audit.log("webhook_trigger_started", {"task_id": task_id, "port": port})
         try:
             with _LOOPBACK_OPENER.open(req, timeout=5) as resp:
-                logger.debug("[A2A] Webhook trigger: %d", resp.status)
+                audit.log("webhook_trigger_accepted", {"task_id": task_id, "status": resp.status})
+                logger.info("[A2A] Webhook trigger accepted for task %s: %d", task_id, resp.status)
                 return
         except Exception as e:
             last_error = e
             if attempt < attempts:
                 time.sleep(delay)
 
-    logger.debug("[A2A] Webhook trigger failed after %d attempts: %s", attempts, last_error)
+    audit.log("webhook_trigger_failed", {"task_id": task_id, "error": str(last_error)})
+    logger.warning("[A2A] Webhook trigger failed for task %s after %d attempts: %s", task_id, attempts, last_error)
 
 
 class A2ARequestHandler(BaseHTTPRequestHandler):
     """Handles A2A HTTP requests."""
 
-    server: "A2AServer"
+    server: Any
 
     def log_message(self, format, *args):
         logger.debug("A2A HTTP: %s", format % args)
@@ -274,6 +274,21 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
                     "id": None,
                 },
                 401,
+            )
+            return
+
+        version = self.headers.get("A2A-Version", "").strip()
+        if version and version != "1.0":
+            self._send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32000,
+                        "message": f"Unsupported A2A-Version: {version}",
+                    },
+                    "id": None,
+                },
+                406,
             )
             return
 
@@ -413,6 +428,7 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             }
 
         task = task_queue.enqueue(task_id, user_text, metadata)
+        logger.info("[A2A] Enqueued inbound task %s", task_id)
 
         threading.Thread(
             target=_trigger_webhook,
@@ -484,7 +500,7 @@ class A2AServer(ThreadingHTTPServer):
         super().__init__((host, port), A2ARequestHandler)
 
     def build_agent_card(self) -> dict:
-        host, port = self.server_address
+        host, port = cast(tuple[str, int], self.server_address)
         public_url = os.getenv("A2A_PUBLIC_URL") or os.getenv("HERMES_A2A_PUBLIC_URL") or f"http://{host}:{port}"
         return {
             "name": self.agent_name,
@@ -518,62 +534,6 @@ class A2AServer(ThreadingHTTPServer):
                 "schemes": ["bearer"] if self.auth_token else [],
             },
         }
-
-
-def _harness_memory_path() -> Path:
-    return Path(os.getenv("HERMES_HOME", "/opt/data")) / "a2a-harness-memory.json"
-
-
-def _remembered_number_from_prompt(text: str) -> str | None:
-    match = _REMEMBER_NUMBER_RE.search(text)
-    if match is None:
-        return None
-    return match.group(1)
-
-
-def _store_harness_number(number: str) -> None:
-    path = _harness_memory_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"remembered_number": number}), encoding="utf-8")
-
-
-def _load_harness_number() -> str:
-    try:
-        payload = json.loads(_harness_memory_path().read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return ""
-    if not isinstance(payload, dict):
-        return ""
-    value = payload.get("remembered_number")
-    return value if isinstance(value, str) else ""
-
-
-def _harness_response_text(user_text: str) -> str:
-    remembered = _remembered_number_from_prompt(user_text)
-    if remembered:
-        _store_harness_number(remembered)
-    normalized = user_text.lower()
-    if "ask peer" in normalized and "beta" in normalized:
-        return "beta ready"
-    if "what number" in normalized and ("tell" in normalized or "remember" in normalized):
-        number = remembered or _load_harness_number()
-        if number:
-            return number
-    reply_marker = re.search(r"reply\s+with:\s*([^\n.]+)", user_text, re.IGNORECASE)
-    if reply_marker:
-        return reply_marker.group(1).strip()
-    if remembered:
-        return f"Remembered: {remembered}"
-    return user_text
-
-
-def _harness_task_result(task_id: str, user_text: str) -> dict:
-    text = _harness_response_text(user_text)
-    return {
-        "id": task_id,
-        "status": {"state": "completed"},
-        "artifacts": [{"parts": [{"type": "text", "text": text}], "index": 0}],
-    }
 
 
 def _task_to_v1(task: dict) -> dict:
