@@ -80,7 +80,7 @@ routes = extra.setdefault("routes", {})
 routes["a2a_trigger"] = {
     "events": ["a2a_inbound"],
     "secret": os.environ["A2A_WEBHOOK_SECRET"],
-    "prompt": "[A2A wake] Process pending A2A queue.\\ntask_id={task_id}\\ntask_text={task_text}\\nsender_name={sender_name}\\nkind={kind}\\ncorrelation_id={correlation_id}",
+    "prompt": "[A2A wake] Process pending A2A queue.\ntask_id={task_id}\ntask_text={task_text}\nsender_name={sender_name}\nkind={kind}\ncorrelation_id={correlation_id}",
     "deliver": "log",
 }
 
