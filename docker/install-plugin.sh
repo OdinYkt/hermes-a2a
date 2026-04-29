@@ -60,13 +60,20 @@ plugins = config.setdefault("plugins", {})
 enabled = plugins.get("enabled")
 if not isinstance(enabled, list):
     enabled = []
-if "a2a" not in enabled:
-    enabled.append("a2a")
+
+# Always-enabled plugins. ``observability/langfuse`` ships bundled with
+# ``hermes-agent`` >= v0.11.0; on older base images the entry is harmless
+# (Hermes logs a warning and skips it).
+for plugin in ("a2a", "observability/langfuse"):
+    if plugin not in enabled:
+        enabled.append(plugin)
 plugins["enabled"] = sorted(set(enabled))
 
 disabled = plugins.get("disabled")
 if isinstance(disabled, list):
-    plugins["disabled"] = [name for name in disabled if name != "a2a"]
+    plugins["disabled"] = [
+        name for name in disabled if name not in ("a2a", "observability/langfuse")
+    ]
 
 platforms = config.setdefault("platforms", {})
 webhook = platforms.setdefault("webhook", {})
