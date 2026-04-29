@@ -45,6 +45,62 @@ def _err(msg: str) -> str:
     return json.dumps({"error": msg}, ensure_ascii=False)
 
 
+def _unwrap_v1(rpc_result: dict) -> dict:
+    """Strip the v1 SendMessageResponse oneof discriminator.
+
+    Why: v1.0 wraps Task/Message under ``result.task`` / ``result.message``
+    while v0.2/v0.3 place Task fields directly on ``result``. Try v1 first,
+    fall back to the flat shape so legacy peers still parse.
+    """
+    if not isinstance(rpc_result, dict):
+        return {}
+    return rpc_result.get("task") or rpc_result.get("message") or rpc_result
+
+
+def _extract_part_text(part: dict) -> str:
+    """Pull text out of a Part regardless of protocol version.
+
+    v0.2 Part: {"type": "text", "text": "..."}
+    v0.3 Part: {"kind": "text", "text": "..."}
+    v1.0 Part: {"text": "..."}  # type implied by proto oneof, no marker
+    Non-text parts (data/file) return "".
+    """
+    if not isinstance(part, dict):
+        return ""
+    text = part.get("text")
+    return text if isinstance(text, str) else ""
+
+
+def _extract_response_text(payload: dict) -> str:
+    """Walk Task artifacts → Message parts → status.message.parts.
+
+    Caller already unwrapped v1 oneof via _unwrap_v1. Returns concatenated
+    text or "" if no text parts found.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    chunks: list[str] = []
+    for artifact in payload.get("artifacts") or []:
+        if not isinstance(artifact, dict):
+            continue
+        for part in artifact.get("parts") or []:
+            text = _extract_part_text(part)
+            if text:
+                chunks.append(text)
+    if not chunks:
+        for part in payload.get("parts") or []:
+            text = _extract_part_text(part)
+            if text:
+                chunks.append(text)
+    if not chunks:
+        status_msg = (payload.get("status") or {}).get("message") or {}
+        for part in status_msg.get("parts") or []:
+            text = _extract_part_text(part)
+            if text:
+                chunks.append(text)
+    return "\n".join(chunks)
+
+
 def _http_request(method: str, url: str, json_body: dict = None, headers: dict = None) -> dict:
     """Synchronous HTTP request using urllib (no async dependency)."""
     import urllib.request
@@ -306,35 +362,15 @@ def handle_call(args: dict, **kwargs) -> str:
         return _err(f"Call failed: RPC -{rpc_error.get('code')}: {rpc_error.get('message')}")
 
     rpc_result = result.get("result", {})
-    # Modern response: result is Task or Message. Legacy: result has id/status/artifacts.
-    task_state = rpc_result.get("status", {}).get("state") or rpc_result.get("state", "unknown")
-
-    response_text = ""
-    # Legacy artifact path
-    for artifact in rpc_result.get("artifacts", []) or []:
-        for part in artifact.get("parts", []) or []:
-            if part.get("type") == "text" or part.get("kind") == "text":
-                response_text += part.get("text", "") + "\n"
-    # Modern Message-shaped result
-    if not response_text and rpc_result.get("kind") == "message":
-        for part in rpc_result.get("parts", []) or []:
-            if part.get("kind") == "text" or part.get("type") == "text":
-                response_text += part.get("text", "") + "\n"
-    # Modern Task-shaped result with status.message
-    if not response_text:
-        status_msg = (rpc_result.get("status") or {}).get("message") or {}
-        for part in status_msg.get("parts", []) or []:
-            if part.get("kind") == "text" or part.get("type") == "text":
-                response_text += part.get("text", "") + "\n"
-
-    # sanitize_inbound: strip prompt injection from what we received
-    response_text = sanitize_inbound(response_text.strip())
+    payload = _unwrap_v1(rpc_result)
+    task_state = (payload.get("status") or {}).get("state") or payload.get("state", "unknown")
+    response_text = sanitize_inbound(_extract_response_text(payload).strip())
 
     from .security import audit
     audit.log("call_inbound", {"source": url, "task_state": task_state, "task_id": task_id})
 
     return _ok({
-        "task_id": rpc_result.get("id", task_id),
+        "task_id": payload.get("id", task_id),
         "state": task_state,
         "response": response_text or "(no text response)",
         "source": url,
@@ -387,9 +423,10 @@ def handle_call_async(args: dict, **kwargs) -> str:
         return _err(f"Async submit failed: RPC -{rpc_error.get('code')}: {rpc_error.get('message')}")
 
     rpc_result = result.get("result") or {}
-    state = rpc_result.get("status", {}).get("state") or rpc_result.get("state", "submitted")
+    payload = _unwrap_v1(rpc_result)
+    state = (payload.get("status") or {}).get("state") or payload.get("state", "submitted")
     return _ok({
-        "task_id": rpc_result.get("id") or task_id,
+        "task_id": payload.get("id") or task_id,
         "state": state,
         "callback_via": "wait for incoming A2A msg with metadata.kind=callback-result",
         "source": url,
@@ -426,16 +463,13 @@ def handle_get_task(args: dict, **kwargs) -> str:
         return _err(f"get_task RPC error: {rpc_error.get('message')}")
 
     rpc_result = result.get("result") or {}
-    state = rpc_result.get("status", {}).get("state") or rpc_result.get("state", "unknown")
-    response_text = ""
-    for artifact in rpc_result.get("artifacts", []) or []:
-        for part in artifact.get("parts", []) or []:
-            if part.get("type") == "text" or part.get("kind") == "text":
-                response_text += part.get("text", "") + "\n"
+    payload = _unwrap_v1(rpc_result)
+    state = (payload.get("status") or {}).get("state") or payload.get("state", "unknown")
+    response_text = _extract_response_text(payload).strip()
     return _ok({
         "task_id": task_id,
         "state": state,
-        "response": response_text.strip() or "(no text)",
+        "response": response_text or "(no text)",
         "source": url,
     })
 
